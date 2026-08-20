@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ondra SPO 186 — Webový emulátor</title>
+  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1a1a1a; color: #ccc;
+      font-family: 'Courier New', monospace;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh; padding: 20px;
+    }
+    .ondra-logo {
+      width: 644px; height: auto;
+      margin-bottom: 10px;
+      display: block;
+      image-rendering: auto;
+    }
+
+    #screen-wrap { position: relative; border: 3px solid #444; background: #000; }
+    #screen { display: block; image-rendering: pixelated; width: 644px; height: 512px; }
+
+    #overlay {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.85); color: #88bbff; font-size: .88em; gap: 10px;
+    }
+    #overlay.hidden { display: none; }
+
+    .rom-panel {
+      background: #111; border: 1px solid #334; padding: 14px 20px;
+      display: flex; flex-direction: column; gap: 8px; width: 380px;
+    }
+    .rom-panel h3 { color: #88bbff; font-size: .9em; letter-spacing: .1em; margin-bottom: 4px; }
+    .rom-row { display: flex; align-items: center; gap: 8px; }
+    .rom-row label { width: 80px; color: #889; font-size: .8em; flex-shrink: 0; }
+    .rom-row input[type=file] { flex: 1; font-size: .75em; color: #aaa; }
+    .rom-row .slot-info { font-size: .7em; color: #557; }
+
+    .rom-mode { display: flex; gap: 16px; margin: 4px 0; }
+    .rom-mode label { display: flex; align-items: center; gap: 5px; font-size: .8em; color: #889; cursor: pointer; }
+
+    .note { font-size: .7em; color: #557; line-height: 1.5; max-width: 380px; }
+
+    button, .btn {
+      background: #223; border: 1px solid #446; color: #aac;
+      padding: 7px 18px; cursor: pointer; font-family: inherit;
+      font-size: .88em; border-radius: 2px; transition: background .15s;
+    }
+    button:hover, .btn:hover { background: #334; }
+    button:disabled { opacity: .4; cursor: default; }
+
+    .controls {
+      margin-top: 10px; display: flex; gap: 10px;
+      align-items: center; flex-wrap: wrap; justify-content: center;
+    }
+    #status { font-size: .72em; color: #557; }
+
+    #debug-panel {
+      margin-top: 14px; width: 644px; background: #111;
+      border: 1px solid #333; padding: 10px 14px;
+      font-size: .72em; color: #6a8; display: none;
+    }
+    #debug-panel.visible { display: block; }
+    #debug-panel pre { white-space: pre; line-height: 1.6; }
+
+    .rom-presets {
+      display: flex; flex-wrap: wrap; gap: 6px; justify-content: center;
+      margin-bottom: 4px;
+    }
+    .preset-btn {
+      background: #1a2a3a; border: 1px solid #3a6a9a; color: #88bbff;
+      padding: 6px 12px; cursor: pointer; font-family: inherit;
+      font-size: .8em; border-radius: 2px; transition: background .15s;
+    }
+    .preset-btn:hover { background: #2a3a5a; }
+    .rom-divider {
+      text-align: center; font-size: .7em; color: #446;
+      margin: 8px 0 6px 0;
+    }
+
+    .leds {
+      display: flex; gap: 20px; margin: 8px 0 2px 0;
+      align-items: center; justify-content: center;
+    }
+    .led-item {
+      display: flex; flex-direction: column;
+      align-items: center; gap: 4px;
+      font-size: 0.65em; color: #556; letter-spacing: 0.05em;
+    }
+    .led {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: #222; border: 1px solid #444;
+      box-shadow: none; transition: background 0.05s, box-shadow 0.05s;
+    }
+    .led.on.led-yellow { background: #FFD700; box-shadow: 0 0 6px #FFD700; }
+    .led.on.led-green  { background: #00CC44; box-shadow: 0 0 6px #00CC44; }
+
+
+    .chip-badge {
+      display: inline-block; font-size: .65em; color: #667;
+      background: #1a1a2a; border: 1px solid #334;
+      padding: 1px 5px; border-radius: 2px; margin-left: 4px;
+    }
+    dialog {
+      width: min(620px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+      margin: auto; padding: 22px; overflow: auto;
+      color: #ccc; background: #151515; border: 1px solid #557;
+      font-family: inherit; line-height: 1.5;
+    }
+    dialog::backdrop { background: rgba(0,0,0,.78); }
+    dialog h2 { color: #88bbff; font-size: 1.05em; margin-bottom: 12px; }
+    dialog h3 { color: #aac; font-size: .9em; margin: 16px 0 6px; }
+    dialog p, dialog li { font-size: .78em; }
+    dialog ul { margin-left: 20px; }
+    dialog .close-row { text-align: right; margin-top: 18px; }
+
+    /* Dotyková klávesnice — na desktopu zůstává skrytá. */
+    .onscreen-keyboard {
+      display: none;
+      width: min(100%, 644px);
+      margin-top: 10px;
+      padding: 8px;
+      border: 1px solid #333;
+      border-radius: 5px;
+      background-color: #111;
+      background-image:
+        radial-gradient(circle at 20% 20%, rgba(255,255,255,.035) 0 1px, transparent 1px),
+        radial-gradient(circle at 70% 65%, rgba(255,255,255,.025) 0 1px, transparent 1px);
+      background-size: 5px 5px, 7px 7px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 4px 14px rgba(0,0,0,.35);
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    .osk-brand {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 8px;
+      height: 24px;
+      margin: 0 2px 7px;
+      color: #eee;
+      font-family: Arial, sans-serif;
+      font-weight: 700;
+    }
+    .osk-wordmark { display: flex; align-items: center; gap: 5px; font-size: 15px; }
+    .osk-marks { display: flex; gap: 2px; transform: skew(-18deg); }
+    .osk-marks i { display: block; width: 9px; height: 11px; background: #ddd; }
+    .osk-marks i:last-child { background: #2e7fd4; }
+    .osk-blue-line { height: 10px; background: #2e7fd4; }
+    .osk-tesla { padding: 0 4px; font-size: 11px; letter-spacing: .16em; color: #bbb; }
+    .osk-row {
+      display: grid;
+      grid-template-columns: repeat(10, minmax(0, 1fr));
+      gap: 4px;
+      margin-top: 4px;
+    }
+    button.osk-key {
+      position: relative;
+      min-width: 0;
+      height: clamp(42px, 11.2vw, 58px);
+      padding: 3px 1px;
+      overflow: hidden;
+      border: 1px solid #555;
+      border-radius: 5px;
+      color: #eee;
+      background: linear-gradient(#4a4a4a 0%, #292929 58%, #171717 100%);
+      box-shadow:
+        inset 0 2px 2px rgba(255,255,255,.2),
+        inset 0 -3px 4px rgba(0,0,0,.65),
+        0 2px 2px rgba(0,0,0,.65);
+      font-family: Arial, sans-serif;
+      font-size: clamp(10px, 3vw, 16px);
+      line-height: 1;
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    button.osk-key:hover { background: linear-gradient(#4a4a4a 0%, #292929 58%, #171717 100%); }
+    button.osk-key:focus-visible { outline: 2px solid #6ab2ff; outline-offset: 1px; }
+    button.osk-key.pressed,
+    button.osk-key.latched {
+      transform: translateY(2px);
+      color: #fff;
+      border-color: #6ab2ff;
+      background: linear-gradient(#245f9c, #173e68);
+      box-shadow: inset 0 2px 5px rgba(0,0,0,.55), 0 0 6px rgba(63,145,230,.55);
+    }
+    .osk-key .osk-secondary {
+      display: block;
+      min-height: 13px;
+      font-size: .72em;
+      color: #d7d7d7;
+      letter-spacing: .02em;
+    }
+    .osk-key .osk-primary { display: block; margin-top: 2px; font-size: 1.25em; font-weight: 500; }
+    .osk-key.osk-light {
+      color: #161616;
+      background: linear-gradient(#eee, #bcbcbc 62%, #888);
+      border-color: #ddd;
+      text-shadow: 0 1px rgba(255,255,255,.5);
+    }
+    button.osk-key.osk-light:hover { background: linear-gradient(#eee, #bcbcbc 62%, #888); }
+    button.osk-key.osk-light.pressed,
+    button.osk-key.osk-light.latched { background: linear-gradient(#78b9f4, #397cad); }
+    .osk-key.osk-space { grid-column: span 4; }
+    .osk-key.osk-wide-label { font-size: clamp(8px, 2.35vw, 13px); font-weight: 700; }
+
+    @media (pointer: coarse) and (orientation: portrait),
+           (max-width: 720px) and (orientation: portrait) {
+      body { padding: 8px; }
+      .ondra-logo, #screen-wrap, #debug-panel { width: min(100%, 644px); }
+      #screen { width: 100%; height: auto; aspect-ratio: 5 / 4; }
+      .rom-panel { width: min(380px, calc(100vw - 36px)); padding: 10px; }
+      .rom-row { align-items: flex-start; flex-wrap: wrap; }
+      .rom-row label { width: 72px; }
+      .rom-row input[type=file] { min-width: 0; width: calc(100% - 80px); }
+      .onscreen-keyboard { display: block; }
+      .controls { width: min(100%, 644px); gap: 6px; }
+      .controls .btn { padding: 7px 10px; font-size: .76em; }
+    }
+  </style>
+</head>
+<body>
+
+<img src="ondra-TESLA-logo.png" alt="Ondra SPO 186 — Tesla" class="ondra-logo">
+
+<div id="screen-wrap">
+  <canvas id="screen" width="320" height="256"></canvas>
+
+  <div id="overlay">
+    <div style="font-size:1.05em; letter-spacing:.08em;">Ondra SPO 186 Emulátor</div>
+
+    <div class="rom-panel">
+      <h3>▸ VYBRAT ROM</h3>
+
+      <div class="rom-presets">
+        <button class="preset-btn" onclick="loadPreset('Ondra_BASICEXP_V5')">Basic EXP V5</button>
+        <button class="preset-btn" onclick="loadPreset('Ondra_PLUS')">Ondra PLUS</button>
+        <button class="preset-btn" onclick="loadPreset('Ondra_TESLA_V5')">Tesla V5</button>
+        <button class="preset-btn" onclick="loadPreset('Ondra_ViLi_v25')">ViLi v2.5</button>
+        <button class="preset-btn" onclick="loadPreset('Ondra_ViLi_v27')">ViLi v2.7</button>
+      </div>
+
+      <div class="rom-divider">— nebo vlastní ROM —</div>
+
+      <div class="rom-row">
+        <label>Patice A:</label>
+        <input type="file" id="rom-A" accept=".rom,.bin,.img,.raw,.eprom,application/octet-stream">
+        <span class="slot-info" id="info-A">—</span>
+      </div>
+      <div class="rom-row">
+        <label>Patice B:</label>
+        <input type="file" id="rom-B" accept=".rom,.bin,.img,.raw,.eprom,application/octet-stream">
+        <span class="slot-info" id="info-B">—</span>
+      </div>
+      <button id="btn-start-rom" onclick="startFromRomInputs()" disabled>▶ Spustit vlastní</button>
+    </div>
+  </div>
+</div>
+
+<div class="leds">
+  <div class="led-item">
+    <div class="led led-green" id="led-1"></div>
+    <span>LED1</span>
+  </div>
+  <div class="led-item">
+    <div class="led led-yellow" id="led-2"></div>
+    <span>LED2</span>
+  </div>
+</div>
+
+<section id="onscreen-keyboard" class="onscreen-keyboard" aria-label="Dotyková klávesnice Ondry">
+  <div class="osk-brand" aria-hidden="true">
+    <span class="osk-wordmark"><span class="osk-marks"><i></i><i></i><i></i></span>ondra</span>
+    <span class="osk-blue-line"></span>
+    <span class="osk-tesla">TESLA</span>
+  </div>
+
+  <div class="osk-row">
+    <button type="button" class="osk-key" data-code="KeyQ" aria-label="Q"><span class="osk-secondary">! &nbsp;1</span><span class="osk-primary">Q</span></button>
+    <button type="button" class="osk-key" data-code="KeyW" aria-label="W"><span class="osk-secondary">„ &nbsp;2</span><span class="osk-primary">W</span></button>
+    <button type="button" class="osk-key" data-code="KeyE" aria-label="E"><span class="osk-secondary"># &nbsp;3</span><span class="osk-primary">E</span></button>
+    <button type="button" class="osk-key" data-code="KeyR" aria-label="R"><span class="osk-secondary">$ &nbsp;4</span><span class="osk-primary">R</span></button>
+    <button type="button" class="osk-key" data-code="KeyT" aria-label="T"><span class="osk-secondary">% &nbsp;5</span><span class="osk-primary">T</span></button>
+    <button type="button" class="osk-key" data-code="KeyY" aria-label="Y"><span class="osk-secondary">&amp; &nbsp;6</span><span class="osk-primary">Y</span></button>
+    <button type="button" class="osk-key" data-code="KeyU" aria-label="U"><span class="osk-secondary">' &nbsp;7</span><span class="osk-primary">U</span></button>
+    <button type="button" class="osk-key" data-code="KeyI" aria-label="I"><span class="osk-secondary">( &nbsp;8</span><span class="osk-primary">I</span></button>
+    <button type="button" class="osk-key" data-code="KeyO" aria-label="O"><span class="osk-secondary">) &nbsp;9</span><span class="osk-primary">O</span></button>
+    <button type="button" class="osk-key" data-code="KeyP" aria-label="P"><span class="osk-secondary">@ &nbsp;Ø</span><span class="osk-primary">P</span></button>
+  </div>
+
+  <div class="osk-row">
+    <button type="button" class="osk-key" data-code="KeyA" aria-label="A"><span class="osk-secondary">−</span><span class="osk-primary">A</span></button>
+    <button type="button" class="osk-key" data-code="KeyS" aria-label="S"><span class="osk-secondary">+</span><span class="osk-primary">S</span></button>
+    <button type="button" class="osk-key" data-code="KeyD" aria-label="D"><span class="osk-secondary">=</span><span class="osk-primary">D</span></button>
+    <button type="button" class="osk-key" data-code="KeyF" aria-label="F"><span class="osk-secondary">↟</span><span class="osk-primary">F</span></button>
+    <button type="button" class="osk-key" data-code="KeyG" aria-label="G"><span class="osk-secondary">_</span><span class="osk-primary">G</span></button>
+    <button type="button" class="osk-key" data-code="KeyH" aria-label="H"><span class="osk-secondary">&lt;</span><span class="osk-primary">H</span></button>
+    <button type="button" class="osk-key" data-code="KeyJ" aria-label="J"><span class="osk-secondary">&gt;</span><span class="osk-primary">J</span></button>
+    <button type="button" class="osk-key" data-code="KeyK" aria-label="K"><span class="osk-secondary">[</span><span class="osk-primary">K</span></button>
+    <button type="button" class="osk-key" data-code="KeyL" aria-label="L"><span class="osk-secondary">]</span><span class="osk-primary">L</span></button>
+    <button type="button" class="osk-key osk-light" data-code="Enter" aria-label="Enter"><span class="osk-primary">↵</span></button>
+  </div>
+
+  <div class="osk-row">
+    <button type="button" class="osk-key osk-light osk-wide-label" data-code="ShiftLeft" data-modifier="true" aria-label="Shift" aria-pressed="false">SHIFT</button>
+    <button type="button" class="osk-key" data-code="KeyZ" aria-label="Z"><span class="osk-secondary">*</span><span class="osk-primary">Z</span></button>
+    <button type="button" class="osk-key" data-code="KeyX" aria-label="X"><span class="osk-secondary">/</span><span class="osk-primary">X</span></button>
+    <button type="button" class="osk-key" data-code="KeyC" aria-label="C"><span class="osk-secondary">:</span><span class="osk-primary">C</span></button>
+    <button type="button" class="osk-key" data-code="KeyV" aria-label="V"><span class="osk-secondary">;</span><span class="osk-primary">V</span></button>
+    <button type="button" class="osk-key" data-code="KeyB" aria-label="B"><span class="osk-secondary">?</span><span class="osk-primary">B</span></button>
+    <button type="button" class="osk-key" data-code="KeyN" aria-label="N"><span class="osk-secondary">,</span><span class="osk-primary">N</span></button>
+    <button type="button" class="osk-key" data-code="KeyM" aria-label="M"><span class="osk-secondary">.</span><span class="osk-primary">M</span></button>
+    <button type="button" class="osk-key osk-light" data-code="ArrowUp" aria-label="Šipka nahoru"><span class="osk-primary">↑</span></button>
+    <button type="button" class="osk-key osk-wide-label" data-code="ControlLeft" data-modifier="true" aria-label="Control" aria-pressed="false">CTRL</button>
+  </div>
+
+  <div class="osk-row">
+    <button type="button" class="osk-key osk-light osk-wide-label" data-code="AltLeft" data-modifier="true" aria-label="Symbols" aria-pressed="false">SYM</button>
+    <button type="button" class="osk-key osk-wide-label" data-code="ShiftRight" data-modifier="true" aria-label="Číslice nula až devět" aria-pressed="false">0–9</button>
+    <button type="button" class="osk-key osk-light osk-wide-label" data-code="AltRight" data-modifier="true" aria-label="Česky" aria-pressed="false">ČS</button>
+    <button type="button" class="osk-key osk-space" data-code="Space" aria-label="Mezerník"></button>
+    <button type="button" class="osk-key osk-light" data-code="ArrowLeft" aria-label="Šipka vlevo"><span class="osk-primary">←</span></button>
+    <button type="button" class="osk-key osk-light" data-code="ArrowDown" aria-label="Šipka dolů"><span class="osk-primary">↓</span></button>
+    <button type="button" class="osk-key osk-light" data-code="ArrowRight" aria-label="Šipka vpravo"><span class="osk-primary">→</span></button>
+  </div>
+</section>
+
+<div class="controls">
+  <button class="btn" onclick="resetEmulator()">↺ Reset</button>
+  <button class="btn" onclick="togglePause()">⏸ Pauza</button>
+  <button class="btn" onclick="toggleDebug()">⚙ Debug</button>
+  <button class="btn" disabled title="Načítání TAP, CSW a WAV zatím není implementováno">📼 Páska (zatím ne)</button>
+  <button class="btn" onclick="document.getElementById('bin-file').click()">⬇ Nahrát BIN</button>
+  <input type="file" id="bin-file" accept=".bin,.com,.prg" style="display:none" onchange="loadBinary(this)">
+  <button class="btn" onclick="saveSnapshot()">💾 Uložit stav</button>
+  <button class="btn" onclick="document.getElementById('snapshot-file').click()">📂 Nahrát stav</button>
+  <input type="file" id="snapshot-file" accept=".osn,application/octet-stream" style="display:none" onchange="loadSnapshot(this)">
+  <button class="btn" onclick="triggerNMI()" title="Non-Maskable Interrupt — jako tlačítko na boku Ondry">NMI</button>
+  <button class="btn" onclick="document.getElementById('help-dialog').showModal()">? Nápověda</button>
+  <input type="file" id="tape-file" accept=".tap,.csw,.wav" style="display:none" onchange="loadTape(this)">
+  <span id="status">Čekám na ROM…</span>
+</div>
+
+<dialog id="help-dialog">
+  <h2>Ondra SPO 186 — stručná nápověda</h2>
+  <p>Webulátor emuluje procesor Z80, paměť a stránkování Ondry, programovatelné černobílé video, klávesnici, obě LED, interní zvuk a hudební interface Melodik se zvukovým čipem SN76489.</p>
+
+  <h3>Spuštění a ovládání</h3>
+  <ul>
+    <li>Vyberte jednu z přednastavených ROM nebo nahrajte obrazy EPROM do patic A a B.</li>
+    <li>Reset uvede počítač do výchozího stavu, Pauza zastaví a znovu spustí emulaci.</li>
+    <li>NMI odpovídá bočnímu tlačítku skutečné Ondry.</li>
+    <li>Debug ukazuje registry CPU, stránkování, video režim a stav klávesnice.</li>
+    <li>Nahrát BIN zavede blokový program přímo do RAM a spustí jej od uložené startovací adresy.</li>
+    <li>Uložit stav vytvoří samostatný snapshot <code>.osn</code>; Nahrát stav obnoví CPU, RAM, ROM, video i zvuk přesně do uloženého okamžiku.</li>
+  </ul>
+
+  <h3>Klávesnice</h3>
+  <p>Levý Shift = SHIFT, pravý Shift = NUMBERS, levý Alt = SYMBOLS, pravý Alt nebo Caps Lock = ČS, Ctrl = CTRL. Kurzorové klávesy a Backspace odpovídají klávesám Ondry; numerická klávesnice ovládá joystick. Na dotykovém zařízení v režimu na výšku se pod obrazovkou zobrazí klávesnice Ondry. SHIFT, SYM, 0–9, ČS a CTRL se klepnutím zamknou a dalším klepnutím uvolní.</p>
+
+  <h3>Zatím neumí</h3>
+  <ul>
+    <li>Načítat kazetové formáty TAP, CSW ani WAV.</li>
+    <li>Emulovat tiskárnu a síťové propojení.</li>
+    <li>Používat fyzický gamepad přes Gamepad API.</li>
+  </ul>
+  <div class="close-row"><button onclick="document.getElementById('help-dialog').close()">Zavřít</button></div>
+</dialog>
+
+<div id="debug-panel">
+  <pre id="debug-output">CPU stav se zobrazí po spuštění…</pre>
+</div>
+
+<script src="Z80.js?v=rc1-audio1"></script>
+<script src="SN76489.js?v=rc1-audio1"></script>
+<script src="ondra.js?v=rc1-keyboard2"></script>
+<script>
+// ----------------------------------------------------------------------------
+//  ROM loader UI logika
+// ----------------------------------------------------------------------------
+
+async function readFile(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload  = ev => res(new Uint8Array(ev.target.result));
+    r.onerror = () => rej(new Error('Chyba čtení souboru'));
+    r.readAsArrayBuffer(file);
+  });
+}
+
+['rom-A', 'rom-B'].forEach(id => {
+  document.getElementById(id).addEventListener('change', function() {
+    const f = this.files[0];
+    const infoId = id === 'rom-A' ? 'info-A' : 'info-B';
+    if (f) {
+      const kb = (f.size / 1024).toFixed(0);
+      const chips = { 2048: '2716', 4096: '2732', 8192: '2764' };
+      const chip = chips[f.size];
+      document.getElementById(infoId).textContent = chip ? `${kb} KB (${chip})` : `${kb} KB — nepodporováno`;
+    } else {
+      document.getElementById(infoId).textContent = '—';
+    }
+    const fileA = document.getElementById('rom-A').files[0];
+    const fileB = document.getElementById('rom-B').files[0];
+    const valid = file => !file || [2048, 4096, 8192].includes(file.size);
+    document.getElementById('btn-start-rom').disabled = !fileA || !valid(fileA) || !valid(fileB);
+  });
+});
+
+async function startFromRomInputs() {
+  try {
+    const fileA = document.getElementById('rom-A').files[0];
+    const fileB = document.getElementById('rom-B').files[0];
+    const dataA = await readFile(fileA);
+    const dataB = fileB ? await readFile(fileB) : null;
+    startEmulator(buildRom(dataA, dataB));
+  } catch(e) {
+    alert('Chyba načítání ROM: ' + e.message);
+  }
+}
+
+async function loadPreset(name) {
+  try {
+    // Načíst oba soubory z roms/ — název je case-insensitive v praxi,
+    // ale fetch je case-sensitive, takže používáme přesné názvy souborů
+    const fetchRom = async (suffix) => {
+      const url = `roms/${name}_${suffix}.rom`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`Nelze načíst ${url} (${r.status})`);
+      return new Uint8Array(await r.arrayBuffer());
+    };
+    setStatus(`Načítám ${name}…`);
+    const dataA = await fetchRom('a');
+    const dataB = await fetchRom('b');
+    startEmulator(buildRom(dataA, dataB));
+  } catch(e) {
+    alert('Chyba načítání předvolby: ' + e.message);
+    setStatus('Chyba načítání ROM');
+  }
+}
+</script>
+
+</body>
+</html>
