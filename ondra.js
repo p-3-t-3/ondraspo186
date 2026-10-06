@@ -1077,62 +1077,11 @@ function loadBinary(input) {
 
   const reader = new FileReader();
   reader.onload = function(ev) {
-    const oldPaused = paused;
-    paused = true;
-
     try {
-      const data = new Uint8Array(ev.target.result);
-      const parsedBlocks = [];
-      let pos = 0;
-      let startAddr = null;
-
-      // Nejdřív ověřit celý soubor; stav stroje se při chybě nesmí změnit.
-      while (pos < data.length) {
-        const typ = data[pos++];
-        if (typ === 0x01) {
-          if (pos + 4 > data.length) throw new Error('Neočekávaný konec souboru v hlavičce bloku.');
-          const addr = data[pos] | (data[pos + 1] << 8); pos += 2;
-          const length = data[pos] | (data[pos + 1] << 8); pos += 2;
-          if (pos + length > data.length) {
-            throw new Error(`Blok ${parsedBlocks.length + 1}: hlavička říká ${length} B, ale soubor má jen ${data.length - pos} B.`);
-          }
-          if (addr + length > 0x10000) {
-            throw new Error(`Blok ${parsedBlocks.length + 1} přesahuje konec paměti.`);
-          }
-          parsedBlocks.push({ addr, bytes: data.slice(pos, pos + length) });
-          pos += length;
-        } else if (typ === 0x02) {
-          if (pos + 2 > data.length) throw new Error('Neočekávaný konec souboru ve startovací hlavičce.');
-          startAddr = data[pos] | (data[pos + 1] << 8); pos += 2;
-          break;
-        } else {
-          throw new Error(`Neznámý typ bloku 0x${typ.toString(16)} na offsetu ${pos - 1}.`);
-        }
-      }
-
-      mp1Enabled = true;
-      parsedBlocks.forEach((block, index) => {
-        mem.set(block.bytes, block.addr);
-        console.log(`BIN blok ${index + 1}: 0x${block.addr.toString(16).toUpperCase()} + ${block.bytes.length} B`);
-      });
-
-      const startHex = startAddr !== null
-        ? `→ start 0x${startAddr.toString(16).toUpperCase()}`
-        : '(bez startovací adresy)';
-      const blockCount = parsedBlocks.length;
-      setStatus(`⬇ ${file.name}: ${blockCount} blok${blockCount === 1 ? '' : 'ů'} ${startHex}`);
-
-      if (startAddr !== null && cpu) {
-        const state = cpu.getState();
-        state.pc = startAddr;
-        if ('halted' in state) state.halted = false;
-        cpu.setState(state);
-      }
+      applyBinary(new Uint8Array(ev.target.result), file.name);
     } catch(e) {
       alert('Chyba načítání BIN: ' + e.message);
       setStatus('BIN nebyl načten');
-    } finally {
-      paused = oldPaused;
     }
   };
   reader.onerror = () => {
@@ -1140,4 +1089,62 @@ function loadBinary(input) {
     setStatus('BIN nebyl načten');
   };
   reader.readAsArrayBuffer(file);
+}
+
+// Zavede BIN data do RAM a nastaví PC; při chybě vyhodí výjimku
+// a stav stroje nechá beze změny.
+function applyBinary(data, name) {
+  const oldPaused = paused;
+  paused = true;
+
+  try {
+    const parsedBlocks = [];
+    let pos = 0;
+    let startAddr = null;
+
+    // Nejdřív ověřit celý soubor; stav stroje se při chybě nesmí změnit.
+    while (pos < data.length) {
+      const typ = data[pos++];
+      if (typ === 0x01) {
+        if (pos + 4 > data.length) throw new Error('Neočekávaný konec souboru v hlavičce bloku.');
+        const addr = data[pos] | (data[pos + 1] << 8); pos += 2;
+        const length = data[pos] | (data[pos + 1] << 8); pos += 2;
+        if (pos + length > data.length) {
+          throw new Error(`Blok ${parsedBlocks.length + 1}: hlavička říká ${length} B, ale soubor má jen ${data.length - pos} B.`);
+        }
+        if (addr + length > 0x10000) {
+          throw new Error(`Blok ${parsedBlocks.length + 1} přesahuje konec paměti.`);
+        }
+        parsedBlocks.push({ addr, bytes: data.slice(pos, pos + length) });
+        pos += length;
+      } else if (typ === 0x02) {
+        if (pos + 2 > data.length) throw new Error('Neočekávaný konec souboru ve startovací hlavičce.');
+        startAddr = data[pos] | (data[pos + 1] << 8); pos += 2;
+        break;
+      } else {
+        throw new Error(`Neznámý typ bloku 0x${typ.toString(16)} na offsetu ${pos - 1}.`);
+      }
+    }
+
+    mp1Enabled = true;
+    parsedBlocks.forEach((block, index) => {
+      mem.set(block.bytes, block.addr);
+      console.log(`BIN blok ${index + 1}: 0x${block.addr.toString(16).toUpperCase()} + ${block.bytes.length} B`);
+    });
+
+    const startHex = startAddr !== null
+      ? `→ start 0x${startAddr.toString(16).toUpperCase()}`
+      : '(bez startovací adresy)';
+    const blockCount = parsedBlocks.length;
+    setStatus(`⬇ ${name}: ${blockCount} blok${blockCount === 1 ? '' : 'ů'} ${startHex}`);
+
+    if (startAddr !== null && cpu) {
+      const state = cpu.getState();
+      state.pc = startAddr;
+      if ('halted' in state) state.halted = false;
+      cpu.setState(state);
+    }
+  } finally {
+    paused = oldPaused;
+  }
 }

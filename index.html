@@ -356,6 +356,7 @@
     <li>NMI odpovídá bočnímu tlačítku skutečné Ondry.</li>
     <li>Debug ukazuje registry CPU, stránkování, video režim a stav klávesnice.</li>
     <li>Nahrát BIN zavede blokový program přímo do RAM a spustí jej od uložené startovací adresy.</li>
+    <li>Spuštění z odkazu: <code>?ROM=Ondra_ViLi_v25&amp;BIN=IJChZ</code> spustí ROM z adresáře <code>roms/</code> a po jejím startu zavede program z <code>bins/</code> (přípona <code>.bin</code> se doplní automaticky).</li>
     <li>Uložit stav vytvoří samostatný snapshot <code>.osn</code>; Nahrát stav obnoví CPU, RAM, ROM, video i zvuk přesně do uloženého okamžiku.</li>
   </ul>
 
@@ -377,7 +378,7 @@
 
 <script src="Z80.js?v=rc1-audio1"></script>
 <script src="SN76489.js?v=rc1-audio1"></script>
-<script src="ondra.js?v=rc1-keyboard2"></script>
+<script src="ondra.js?v=rc1-urlparams1"></script>
 <script>
 // ----------------------------------------------------------------------------
 //  ROM loader UI logika
@@ -425,23 +426,95 @@ async function startFromRomInputs() {
 
 async function loadPreset(name) {
   try {
-    // Načíst oba soubory z roms/ — název je case-insensitive v praxi,
-    // ale fetch je case-sensitive, takže používáme přesné názvy souborů
-    const fetchRom = async (suffix) => {
-      const url = `roms/${name}_${suffix}.rom`;
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`Nelze načíst ${url} (${r.status})`);
-      return new Uint8Array(await r.arrayBuffer());
-    };
-    setStatus(`Načítám ${name}…`);
-    const dataA = await fetchRom('a');
-    const dataB = await fetchRom('b');
-    startEmulator(buildRom(dataA, dataB));
+    await startPreset(name);
   } catch(e) {
     alert('Chyba načítání předvolby: ' + e.message);
     setStatus('Chyba načítání ROM');
   }
 }
+
+// Načte ROM sadu roms/<name>_a.rom + _b.rom a spustí emulátor; chyby vyhazuje.
+async function startPreset(name) {
+  // fetch je case-sensitive, takže používáme přesné názvy souborů
+  const fetchRom = async (suffix) => {
+    const url = `roms/${name}_${suffix}.rom`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Nelze načíst ${url} (${r.status})`);
+    return new Uint8Array(await r.arrayBuffer());
+  };
+  setStatus(`Načítám ${name}…`);
+  const dataA = await fetchRom('a');
+  const dataB = await fetchRom('b');
+  startEmulator(buildRom(dataA, dataB));
+}
+
+// ----------------------------------------------------------------------------
+//  Spuštění s parametry URL:  index.html?ROM=Ondra_ViLi_v25&BIN=IJChZ
+//    ROM — název sady v roms/ bez přípony _a.rom / _b.rom
+//    BIN — soubor v bins/ (přípona .bin se doplní, pokud chybí)
+//  Názvy parametrů nerozlišují velikost písmen.
+// ----------------------------------------------------------------------------
+
+// Počet snímků (50 fps), po které ROM po startu inicializuje RAM,
+// než do ní zavedeme BIN.
+const BIN_AUTOLOAD_DELAY_FRAMES = 100;
+
+function getUrlParam(name) {
+  for (const [key, value] of new URLSearchParams(location.search)) {
+    if (key.toLowerCase() === name.toLowerCase()) return value.trim();
+  }
+  return null;
+}
+
+// Povolit jen prosté názvy souborů — žádné cesty mimo roms/ a bins/.
+function isSafeFileName(name) {
+  return /^[A-Za-z0-9_.\-]+$/.test(name) && !name.startsWith('.');
+}
+
+async function fetchBinary(name) {
+  const file = /\.[A-Za-z0-9]+$/.test(name) ? name : `${name}.bin`;
+  const url = `bins/${file}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Nelze načíst ${url} (${r.status})`);
+  return { file, data: new Uint8Array(await r.arrayBuffer()) };
+}
+
+function waitForFrames(count) {
+  return new Promise(resolve => {
+    const timer = setInterval(() => {
+      if (totalFrames >= count) { clearInterval(timer); resolve(); }
+    }, 50);
+  });
+}
+
+async function startFromUrlParams() {
+  const romName = getUrlParam('ROM');
+  const binName = getUrlParam('BIN');
+  if (!romName && !binName) return;
+
+  if (!romName) {
+    alert('Parametr BIN vyžaduje i parametr ROM.');
+    return;
+  }
+  try {
+    if (!isSafeFileName(romName)) throw new Error(`Neplatný název ROM: ${romName}`);
+    if (binName && !isSafeFileName(binName)) throw new Error(`Neplatný název BIN: ${binName}`);
+
+    // BIN stáhnout předem, ať se chyba ukáže hned a ROM zbytečně nečeká.
+    const bin = binName ? await fetchBinary(binName) : null;
+    await startPreset(romName);
+    if (bin) {
+      setStatus(`Čekám na start ROM, pak zavedu ${bin.file}…`);
+      await waitForFrames(BIN_AUTOLOAD_DELAY_FRAMES);
+      applyBinary(bin.data, bin.file);
+    }
+  } catch(e) {
+    alert('Chyba spuštění z parametrů URL: ' + e.message);
+    setStatus('Chyba spuštění z parametrů URL');
+  }
+}
+
+startFromUrlParams();
 </script>
 
 </body>

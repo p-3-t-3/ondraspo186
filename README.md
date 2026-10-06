@@ -12,6 +12,20 @@ python3 -m http.server 8000
 
 Potom otevřete `http://localhost:8000`. Vlastní ROM lze vybrat i při přímém otevření `index.html`.
 
+### Spuštění s parametry
+
+ROM a program lze předat v URL:
+
+```
+http://localhost:8000/?ROM=Ondra_ViLi_v25&BIN=IJChZ
+```
+
+- `ROM` — název sady v `roms/` bez přípony; načtou se `<ROM>_a.rom` a `<ROM>_b.rom`.
+- `BIN` — soubor v `bins/`; pokud název nemá příponu, doplní se `.bin`.
+  Program se zavede do RAM asi 2 s po startu ROM (aby ji ROM při inicializaci nepřepsala) a spustí se od své startovací adresy.
+
+Názvy parametrů nerozlišují velikost písmen, hodnoty (názvy souborů) ano. Povolené jsou jen znaky `A–Z a–z 0–9 _ . -`.
+
 ## Co emulátor umí
 
 - procesor Z80 a přerušení INT/NMI;
@@ -73,6 +87,7 @@ Při načítání se nejdřív ověří identifikace formátu, verze, velikosti 
 - `Z80.js` — CPU jádro DrGoldfire/Z80.js
 - `SN76489.js` — emulace zvukového čipu Melodik
 - `roms/` — přednastavené obrazy EPROM
+- `bins/` — BIN programy pro spuštění parametrem `BIN`
 
 ## Licence
 
