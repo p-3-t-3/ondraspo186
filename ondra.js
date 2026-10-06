@@ -326,13 +326,25 @@ class OndraSound extends AudioWorkletProcessor {
     this._tone    = 0;
     this._phase   = 0;
     this._casLvl  = 0;
-    this._pending = null;
+    // Fronta snímků: emulátor je posílá z setInterval, který kolísá proti
+    // hodinám zvukové karty. Rezerva dvou snímků výkyvy vyrovná; při
+    // přeplnění se zahodí nejstarší, aby nerostlo zpoždění.
+    this._queue   = [];
+    this._prefill = true;
     this._buf     = null;
     this._bufPos  = 0;
     this._psgBuf  = null;
     this._psgPos  = 0;
     this.port.onmessage = (e) => {
-      if (e.data.type === 'frame') this._pending = e.data;
+      if (e.data.type === 'frame') {
+        this._queue.push(e.data);
+        if (this._queue.length > 4) this._queue.shift();
+      } else if (e.data.type === 'reset') {
+        this._queue = [];
+        this._buf = null;
+        this._psgBuf = null;
+        this._prefill = true;
+      }
     };
   }
   process(inputs, outputs) {
@@ -340,12 +352,16 @@ class OndraSound extends AudioWorkletProcessor {
     const freqs = [0, 384, 606, 827, 1366, 1508, 1615, 1753];
     for (let i = 0; i < out.length; i++) {
       // Přejít na nový frame buffer
-      if (this._pending && (!this._buf || this._bufPos >= this._buf.length)) {
-        this._buf    = this._pending.buf;
-        this._bufPos = 0;
-        this._psgBuf = this._pending.psg || null;
-        this._psgPos = 0;
-        this._pending = null;
+      if (!this._buf || this._bufPos >= this._buf.length) {
+        if (this._queue.length === 0) this._prefill = true;
+        if (this._prefill && this._queue.length >= 2) this._prefill = false;
+        if (!this._prefill) {
+          const next = this._queue.shift();
+          this._buf    = next.buf;
+          this._bufPos = 0;
+          this._psgBuf = next.psg || null;
+          this._psgPos = 0;
+        }
       }
       // Načíst stav pro tento vzorek
       if (this._buf && this._bufPos < this._buf.length) {
@@ -372,10 +388,41 @@ class OndraSound extends AudioWorkletProcessor {
 registerProcessor('ondra-sound', OndraSound);
 `;
 
+// Prohlížeč pustí zvuk až po interakci uživatele. Při spuštění bez kliknutí
+// (např. z parametrů URL) zůstane AudioContext uspaný, dokud ho neprobudí
+// první klik nebo klávesa.
+let soundEnabled = true;
+
+function wakeAudio() {
+  if (audioCtx && soundEnabled && audioCtx.state === 'suspended') audioCtx.resume();
+}
+window.addEventListener('pointerdown', wakeAudio);
+window.addEventListener('keydown', wakeAudio);
+
+// Návrat na stránku z bfcache (tlačítko Zpět): výstup během skrytí stál,
+// takže zahodit nahromaděné snímky a začít s čistou frontou.
+window.addEventListener('pagehide', () => {
+  if (audioCtx) audioCtx.suspend();
+});
+window.addEventListener('pageshow', e => {
+  if (!e.persisted || !audioCtx) return;
+  if (window._soundNode) window._soundNode.port.postMessage({ type: 'reset' });
+  _audioFramePos = 0;
+  if (soundEnabled) audioCtx.resume();
+});
+
+function setSoundEnabled(on) {
+  soundEnabled = !!on;
+  if (!audioCtx) return;
+  if (soundEnabled) audioCtx.resume();
+  else audioCtx.suspend();
+}
+
 function initAudio() {
   if (audioCtx) return;
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!soundEnabled) audioCtx.suspend();
     const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
     const url  = URL.createObjectURL(blob);
     audioCtx.audioWorklet.addModule(url).then(() => {
@@ -458,8 +505,22 @@ function initVideo() {
   pixels32  = new Uint32Array(imageData.data.buffer);
 }
 
-const COLOR_ON  = 0xFFFFFFFF;
+// Barvy pixelů v pořadí ABGR (Uint32 nad RGBA bufferem, little-endian).
+const DISPLAY_COLORS = {
+  white: { label: 'Bílá',          on: 0xFFFFFFFF, css: '#ffffff' },
+  green: { label: 'Zelený fosfor', on: 0xFF66FF33, css: '#33ff66' },
+  amber: { label: 'Jantar',        on: 0xFF00B0FF, css: '#ffb000' },
+};
+let COLOR_ON  = DISPLAY_COLORS.white.on;
 const COLOR_OFF = 0xFF000000;
+
+function setDisplayColor(id) {
+  const c = DISPLAY_COLORS[id];
+  if (!c) return false;
+  COLOR_ON = c.on;
+  if (ctx && cpu) renderFrame();
+  return true;
+}
 
 function renderFrame() {
   let pixelIdx = 0;
@@ -613,6 +674,7 @@ function keyDown(e) {
 function keyUp(e) {
   if (!KEY_MAP_CODE[e.code]) return;
   setKeyboardInput(e.code, `physical:${e.code}`, false);
+  e.preventDefault(); // mezerník by jinak „stiskl“ zaměřené tlačítko panelu
 }
 
 function resetKeyboardInputs() {
@@ -731,7 +793,7 @@ function startEmulator(romData) {
   window.addEventListener('keyup',   keyUp);
   window.addEventListener('blur',    keyFocusLost);
 
-  document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('overlay')?.classList.add('hidden');
   running = true; paused = false;
   setStatus('▶ Startuji…');
   frameHandle = setInterval(emulatorFrame, FRAME_MS);
@@ -960,7 +1022,7 @@ function restoreSnapshotBuffer(buffer) {
     window.addEventListener('blur',    keyFocusLost);
     setTimeout(_initAudioFrame, 200);
   }
-  document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('overlay')?.classList.add('hidden');
   if (!running) {
     running = true;
     if (!frameHandle) frameHandle = setInterval(emulatorFrame, FRAME_MS);
@@ -1023,20 +1085,32 @@ function loadSnapshot(input) {
   const file = input.files[0];
   if (!file) return;
   input.value = '';
-  const reader = new FileReader();
-  reader.onload = ev => {
-    const oldPaused = paused;
-    paused = true;
-    try {
-      restoreSnapshotBuffer(ev.target.result);
-    } catch(e) {
-      paused = oldPaused;
-      alert('Snapshot se nepodařilo načíst: ' + e.message);
-      setStatus('Snapshot nebyl načten');
-    }
-  };
-  reader.onerror = () => alert('Soubor snapshotu se nepodařilo přečíst.');
-  reader.readAsArrayBuffer(file);
+  loadSnapshotFile(file);
+}
+
+// Vrací Promise<boolean> — true, pokud se snapshot obnovil.
+function loadSnapshotFile(file) {
+  return new Promise(resolve => {
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const oldPaused = paused;
+      paused = true;
+      try {
+        restoreSnapshotBuffer(ev.target.result);
+        resolve(true);
+      } catch(e) {
+        paused = oldPaused;
+        alert('Snapshot se nepodařilo načíst: ' + e.message);
+        setStatus('Snapshot nebyl načten');
+        resolve(false);
+      }
+    };
+    reader.onerror = () => {
+      alert('Soubor snapshotu se nepodařilo přečíst.');
+      resolve(false);
+    };
+    reader.readAsArrayBuffer(file);
+  });
 }
 
 // ----------------------------------------------------------------------------
@@ -1044,7 +1118,8 @@ function loadSnapshot(input) {
 // ----------------------------------------------------------------------------
 
 function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
+  const el = document.getElementById('status');
+  if (el) el.textContent = msg;
 }
 
 // ----------------------------------------------------------------------------

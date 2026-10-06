@@ -41,13 +41,18 @@ Názvy parametrů nerozlišují velikost písmen, hodnoty (názvy souborů) ano.
 - Melodik se zvukovým čipem SN76489;
 - načtení víceblokového BIN souboru přímo do RAM;
 - uložení a obnovení samostatného snapshotu `.osn` včetně CPU, RAM, ROM, videa a zvuku;
-- reset, pauzu, NMI a jednoduchý debug panel.
+- reset, pauzu, NMI, vypnutí zvuku a jednoduchý debug panel;
+- volbu barvy obrazu (bílá, zelený fosfor, jantar) a scanlines;
+- celou obrazovku (tlačítko nebo dvojklik na obraz);
+- přetažení ROM, BIN nebo snapshotu `.osn` myší na obrazovku.
+
+Vzhled je sjednocený s webulátorem PMD 85: vlevo obrazovka, vpravo ovládací panel s předvolbami ROM, paticemi EPROM, programem a kazetou.
 
 Součástí balíčku jsou předvolby Basic EXP V5, Ondra PLUS, Tesla V5 a ViLi 2.5/2.7.
 
 ## Co zatím neumí
 
-- načítání kazet TAP, CSW a WAV;
+- načítání kazet (připravujeme formát TAP);
 - tiskárnu a síťové propojení;
 - fyzický gamepad přes Gamepad API.
 
