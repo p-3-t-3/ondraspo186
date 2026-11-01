@@ -53,18 +53,18 @@
       box-shadow: 0 0 0 2px #000, 0 18px 50px rgba(0,0,0,.7), inset 0 0 60px rgba(0,0,0,.9);
       padding: 10px; position: relative;
     }
-    #screen {
-      display: block; image-rendering: pixelated;
-      width: 640px; height: 512px; background: #000;
+    /* Obrazovka: velikost .tube nastavuje fitCrt() tak, aby jeden pixel Ondry
+       byl vždy celý počet FYZICKÝCH pixelů (k). 640×512 je jen výchozí stav. */
+    .tube { position: relative; width: 640px; height: 512px; margin: 0 auto; }
+    #screen, #scanlines {
+      position: absolute; inset: 0; display: block;
+      width: 100%; height: 100%; image-rendering: pixelated;
     }
-    /* Scanlines — jeden černý proužek na každý z 256 řádků obrazu,
-       takže sedí i při zmenšení obrazovky a na celé obrazovce. */
-    .crt::after {
-      content: ""; position: absolute; inset: 10px; z-index: 1; pointer-events: none;
-      background: linear-gradient(to bottom, transparent 50%, #000 50%);
-      background-size: 100% calc(100% / 256);
-    }
-    .crt.no-scanlines::after { display: none; }
+    #screen { background: #000; }
+    /* Scanlines — samostatné plátno s bitmapou přesně v device pixelech,
+       proto nevzniká zázněj při škálování Windows 125 %/150 % ani při zoomu. */
+    #scanlines { z-index: 1; pointer-events: none; }
+    .crt.no-scanlines #scanlines { display: none; }
 
     /* výzva k výběru ROM přes obrazovku, dokud stroj neběží */
     #overlay {
@@ -81,8 +81,7 @@
       width: 100vw; height: 100vh;
     }
     .stage:fullscreen .crt { border-width: 0; border-radius: 0; box-shadow: none; padding: 0; }
-    .stage:fullscreen #screen { width: auto; height: 92vh; aspect-ratio: 5 / 4; }
-    .stage:fullscreen .crt::after, .stage:fullscreen #overlay { inset: 0; }
+    .stage:fullscreen #overlay { inset: 0; }
 
     /* přetažení souboru na obrazovku */
     .stage.drag .crt { outline: 2px dashed var(--brass); outline-offset: 6px; }
@@ -320,8 +319,7 @@
       .head, .stage, .under, .onscreen-keyboard, .rail, #debug-panel, .foot { grid-column: 1; grid-row: auto; }
       .rail { width: 100%; }
       .crt { border-width: 8px; border-radius: 12px; padding: 6px; }
-      .crt::after, #overlay { inset: 6px; }
-      #screen { width: 100%; height: auto; aspect-ratio: 5 / 4; }
+      #overlay { inset: 6px; }
       .onscreen-keyboard { width: 100%; margin-top: 0; }
     }
     @media (pointer: coarse) and (orientation: portrait),
@@ -358,7 +356,10 @@
     <!-- OBRAZOVKA -->
     <div class="stage" id="stage">
       <div class="crt" id="crt">
-        <canvas id="screen" width="320" height="256"></canvas>
+        <div class="tube" id="tube">
+          <canvas id="screen" width="320" height="256"></canvas>
+          <canvas id="scanlines" width="1" height="512" aria-hidden="true"></canvas>
+        </div>
         <div id="overlay">
           <div class="big">Ondra SPO 186</div>
           <div>Vyberte ROM v ovládacím panelu</div>
@@ -500,8 +501,8 @@
         <input type="file" id="bin-file" accept=".bin,.com,.prg">
       </div>
 
-      <!-- KAZETA = zatím jen připravené místo -->
-      <div class="slot off" id="tape-slot" title="Kazeta — připravujeme">
+      <!-- KAZETA = TAP přehrávaný do vstupu magnetofonu, běží s motorem -->
+      <div class="slot" id="tape-slot" title="Kazeta TAP — hraje, když Ondra zapne motor magnetofonu">
         <svg class="media" viewBox="0 0 90 72" aria-hidden="true">
           <rect x="10" y="14" width="70" height="44" rx="5" fill="#2b2f28" stroke="#000"/>
           <rect x="16" y="20" width="58" height="20" rx="3" fill="#151713"/>
@@ -519,13 +520,14 @@
           <div class="top">
             <span class="kind">KAZETA</span>
             <span class="acts">
-              <button class="act" type="button" title="Vložit (připravujeme)" disabled><svg class="ic"><use href="#ic-load"/></svg></button>
-              <button class="act" type="button" title="Přehrát (připravujeme)" disabled><svg class="ic"><use href="#ic-play"/></svg></button>
-              <button class="act" type="button" title="Vysunout (připravujeme)" disabled><svg class="ic"><use href="#ic-eject"/></svg></button>
+              <button class="act" id="tape-load" type="button" title="Vložit kazetu TAP"><svg class="ic"><use href="#ic-load"/></svg></button>
+              <button class="act" id="tape-play" type="button" title="Přetočit na začátek a přehrát znovu" disabled><svg class="ic"><use href="#ic-play"/></svg></button>
+              <button class="act" id="tape-eject" type="button" title="Vysunout kazetu" disabled><svg class="ic"><use href="#ic-eject"/></svg></button>
             </span>
           </div>
-          <span class="name">— připravujeme —</span>
+          <span class="name" id="tape-name">— žádná —</span>
         </div>
+        <input type="file" id="tape-file" accept=".tap">
       </div>
 
       <hr>
@@ -537,9 +539,9 @@
           <button id="btn-sound" type="button" aria-pressed="true" title="Zapnout / vypnout zvuk">🔊 ZVUK</button>
         </div>
         <div class="btns">
-          <button type="button" onclick="saveSnapshot()" title="Uložit snapshot .osn">💾 ULOŽIT</button>
-          <button type="button" onclick="document.getElementById('snapshot-file').click()" title="Nahrát snapshot .osn">📂 NAHRÁT</button>
-          <input type="file" id="snapshot-file" accept=".osn,application/octet-stream" style="display:none">
+          <button type="button" onclick="saveSnapshot()" title="Uložit snapshot .esnap">💾 ULOŽIT</button>
+          <button type="button" onclick="document.getElementById('snapshot-file').click()" title="Nahrát snapshot .esnap">📂 NAHRÁT</button>
+          <input type="file" id="snapshot-file" accept=".esnap,application/x-emulator-snapshot,application/octet-stream" style="display:none">
         </div>
         <div class="btns">
           <button type="button" onclick="triggerNMI()" title="Non-Maskable Interrupt — jako tlačítko na boku Ondry">NMI</button>
@@ -573,11 +575,12 @@
   <ul>
     <li>V panelu ROM vyberte jednu z předvoleb, nebo tlačítky A a B nahrajte vlastní obrazy EPROM do patic.</li>
     <li>Program nahraje blokový BIN přímo do RAM a spustí jej od uložené startovací adresy.</li>
-    <li>ROM, BIN i snapshot <code>.osn</code> lze také přetáhnout myší na obrazovku.</li>
-    <li>Spuštění z odkazu: <code>?ROM=Ondra_ViLi_v25&amp;BIN=IJChZ</code> spustí ROM z adresáře <code>roms/</code> a po jejím startu zavede program z <code>bins/</code> (přípona <code>.bin</code> se doplní automaticky).</li>
+    <li>Kazeta: vložte soubor <code>.tap</code> a v Ondře spusťte nahrávání. Páska se točí, jen když Ondra zapne motor magnetofonu; ▶ ji přetočí na začátek, Reset také. Průběh je vidět u kazety a signál je slyšet v reproduktoru.</li>
+    <li>ROM, BIN, kazetu <code>.tap</code> i snapshot <code>.esnap</code> lze také přetáhnout myší na obrazovku.</li>
+    <li>Spuštění z odkazu: <code>?ROM=Ondra_ViLi_v25&amp;BIN=IJChZ</code> spustí ROM z adresáře <code>roms/</code> a po jejím startu zavede program z <code>bins/</code> (přípona <code>.bin</code> se doplní automaticky). <code>?ROM=Ondra_ViLi_v27&amp;TAP=jmeno</code> vloží kazetu z <code>tapes/</code> (přípona <code>.tap</code>); nahrávání pak spustíte v ROM.</li>
     <li>Reset uvede počítač do výchozího stavu, Pauza zastaví a znovu spustí emulaci, Zvuk ho ztlumí, NMI odpovídá bočnímu tlačítku skutečné Ondry.</li>
     <li>Při spuštění z odkazu prohlížeč pustí zvuk až po prvním kliknutí nebo stisku klávesy.</li>
-    <li>Uložit vytvoří samostatný snapshot <code>.osn</code>; Nahrát obnoví CPU, RAM, ROM, video i zvuk přesně do uloženého okamžiku.</li>
+    <li>Uložit vytvoří přenositelný snapshot <code>.esnap</code>; Nahrát obnoví CPU, RAM, ROM, video i zvuk přesně do uloženého okamžiku.</li>
     <li>Obraz: barva luminoforu a scanlines; volba se pamatuje. Dvojklik na obraz přepne celou obrazovku.</li>
     <li>Debug ukazuje registry CPU, stránkování, video režim a stav klávesnice.</li>
   </ul>
@@ -587,16 +590,17 @@
 
   <h3>Zatím neumí</h3>
   <ul>
-    <li>Načítat kazety (připravujeme formát TAP).</li>
+    <li>Ukládat na kazetu a načítat kazety ve formátech CSW a WAV.</li>
     <li>Emulovat tiskárnu a síťové propojení.</li>
     <li>Používat fyzický gamepad přes Gamepad API.</li>
   </ul>
   <div class="close-row"><button onclick="document.getElementById('help-dialog').close()">Zavřít</button></div>
 </dialog>
 
+<script src="ESnap.js?v=1.0"></script>
 <script src="Z80.js?v=rc1-audio1"></script>
 <script src="SN76489.js?v=rc1-audio1"></script>
-<script src="ondra.js?v=rc1-ui4"></script>
+<script src="ondra.js?v=rc1-tape1"></script>
 <script>
 // ----------------------------------------------------------------------------
 //  Ovládací panel — sloty médií
@@ -612,7 +616,7 @@ const ROM_PRESETS = [
 
 const EPROM_CHIPS = { 2048: '2716', 4096: '2732', 8192: '2764' };
 
-const SLOT_EMPTY = { rom: '— vložit —', bin: '— žádný —' };
+const SLOT_EMPTY = { rom: '— vložit —', bin: '— žádný —', tape: '— žádná —' };
 
 function setSlot(kind, text) {
   const el = document.getElementById(`${kind}-name`);
@@ -718,6 +722,39 @@ async function loadBinFile(file) {
   }
 }
 
+// --- kazeta TAP ---
+
+const TAPE_LABELS = {
+  stopped: 'zastaveno', armed: 'čeká na motor', playing: 'hraje', done: 'dohráno'
+};
+let tapeSlotText = null;
+
+function updateTapeSlot() {
+  const t = tapeStatus();
+  const text = t.state === 'empty' ? null
+    : `${t.name} — ${TAPE_LABELS[t.state]}${t.state === 'playing' ? ` ${t.progress} %` : ''}`;
+  if (text === tapeSlotText) return;
+  tapeSlotText = text;
+  setSlot('tape', text);
+  document.getElementById('tape-play').disabled = t.state === 'empty';
+  document.getElementById('tape-eject').disabled = t.state === 'empty';
+}
+setInterval(updateTapeSlot, 250);
+
+async function loadTapeFile(file) {
+  try {
+    insertTape(await readFile(file), file.name);
+    const t = tapeStatus();
+    setStatus(`📼 ${file.name}: ${t.blocks} bl., ${t.dataBytes} B`);
+  } catch(e) {
+    alert(`Kazetu ${file.name} nelze vložit: ${e.message}`);
+  }
+  updateTapeSlot();
+}
+
+document.getElementById('tape-play').addEventListener('click', () => { rewindTape(); updateTapeSlot(); });
+document.getElementById('tape-eject').addEventListener('click', () => { ejectTape(); updateTapeSlot(); });
+
 // --- snapshot ---
 
 async function loadSnapFile(file) {
@@ -742,6 +779,7 @@ function wireLoad(buttonId, inputId, onLoad) {
 wireLoad('rom-load-a', 'rom-file-a', f => loadRomFile('A', f));
 wireLoad('rom-load-b', 'rom-file-b', f => loadRomFile('B', f));
 wireLoad('bin-load',   'bin-file',   loadBinFile);
+wireLoad('tape-load',  'tape-file',  loadTapeFile);
 wireLoad(null,         'snapshot-file', loadSnapFile);
 
 // --- reset / pauza ---
@@ -792,10 +830,90 @@ stage.addEventListener('drop', e => {
   const file = e.dataTransfer?.files?.[0];
   if (!file) return;
   const ext = file.name.toLowerCase().split('.').pop();
-  if (ext === 'osn') loadSnapFile(file);
+  if (ext === 'esnap') loadSnapFile(file);
+  else if (ext === 'tap') loadTapeFile(file);
   else if (['rom', 'img', 'raw', 'eprom'].includes(ext)) loadRomFile('A', file);
   else loadBinFile(file);   // .bin / .com / .prg → program
 });
+
+// ----------------------------------------------------------------------------
+//  Měřítko obrazovky a scanlines v FYZICKÝCH pixelech
+//
+//  Při devicePixelRatio 1,25 / 1,5 (škálování Windows, zoom prohlížeče) by
+//  CSS 640×512 znamenalo 2,5 device px na pixel Ondry — rasterizér pak dělá
+//  řádky střídavě 2 a 3 px a scanlines se rozjedou do zázněje. Proto volíme
+//  celé k (device px na pixel Ondry) a CSS velikost dopočítáme jako k / dpr.
+// ----------------------------------------------------------------------------
+
+const SRC_W = 320, SRC_H = 256;          // nativní rozlišení Ondry
+const SCAN_ALPHA = 1;                    // 1 = čistá černá (původní vzhled)
+const DESK_MAX_CSS_W = 768;              // široké okno: cíl ~640 CSS px, strop 768
+const NARROW_MQ = matchMedia('(max-width: 1040px), (pointer: coarse) and (orientation: portrait)');
+
+const crtEl = document.getElementById('crt');
+const tube = document.getElementById('tube');
+const scanCanvas = document.getElementById('scanlines');
+const scanCtx = scanCanvas.getContext('2d');
+let crtK = 0, crtDpr = 0;
+
+function chooseScale(dpr) {
+  const fs = document.fullscreenElement === stage;
+  if (!fs && !NARROW_MQ.matches) {
+    // široké okno: největší k, které se vejde do DESK_MAX_CSS_W (jako dřív pevných 640)
+    return Math.max(1, Math.floor(DESK_MAX_CSS_W * dpr / SRC_W));
+  }
+  let w, h;
+  if (fs) {
+    w = window.innerWidth;
+    h = window.innerHeight;
+  } else {
+    const cs = getComputedStyle(crtEl);
+    w = crtEl.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    h = Infinity;
+  }
+  return Math.max(1, Math.floor(Math.min(w * dpr / SRC_W, h * dpr / SRC_H)));
+}
+
+function drawScanlines() {
+  const H = scanCanvas.height;
+  scanCtx.clearRect(0, 0, scanCanvas.width, H);
+  if (crtK < 2) return;                  // pod 2 device px na řádek se linka nevejde
+  const dark = Math.floor(crtK / 2);     // k=2→1, k=3→1, k=4→2 …
+  scanCtx.fillStyle = `rgba(0,0,0,${SCAN_ALPHA})`;
+  for (let y = crtK - dark; y < H; y += crtK) scanCtx.fillRect(0, y, scanCanvas.width, dark);
+}
+
+function fitCrt() {
+  const dpr = window.devicePixelRatio || 1;
+  const k = chooseScale(dpr);
+  tube.style.width  = (SRC_W * k / dpr) + 'px';
+  tube.style.height = (SRC_H * k / dpr) + 'px';
+  if (k !== crtK || dpr !== crtDpr) {
+    crtK = k;
+    crtDpr = dpr;
+    scanCanvas.height = SRC_H * k;       // šířka 1 px stačí, vodorovně se jen roztáhne
+    drawScanlines();
+  }
+}
+
+let crtFitPending = false;
+function requestFitCrt() {
+  if (crtFitPending) return;
+  crtFitPending = true;
+  requestAnimationFrame(() => { crtFitPending = false; fitCrt(); });
+}
+
+// Změna DPR (jiný monitor, zoom). Dotaz platí pro jednu hodnotu, po změně se zakládá znovu.
+function watchDpr() {
+  const mq = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+  mq.addEventListener('change', () => { requestFitCrt(); watchDpr(); }, { once: true });
+}
+
+window.addEventListener('resize', requestFitCrt);
+document.addEventListener('fullscreenchange', requestFitCrt);
+NARROW_MQ.addEventListener('change', requestFitCrt);
+watchDpr();
+fitCrt();
 
 // ----------------------------------------------------------------------------
 //  Obraz — barva luminoforu a scanlines; volby se pamatují v localStorage
@@ -848,6 +966,8 @@ function applyDisplayColor(id) {
 //  Spuštění s parametry URL:  index.html?ROM=Ondra_ViLi_v25&BIN=IJChZ
 //    ROM — název sady v roms/ bez přípony _a.rom / _b.rom
 //    BIN — soubor v bins/ (přípona .bin se doplní, pokud chybí)
+//    TAP — kazeta v tapes/ (přípona .tap se doplní, pokud chybí); vloží se
+//          a čeká, až ROM zapne motor. Bez ROM jen čeká v šachtě.
 //  Názvy parametrů nerozlišují velikost písmen.
 // ----------------------------------------------------------------------------
 
@@ -862,14 +982,14 @@ function getUrlParam(name) {
   return null;
 }
 
-// Povolit jen prosté názvy souborů — žádné cesty mimo roms/ a bins/.
+// Povolit jen prosté názvy souborů — žádné cesty mimo roms/, bins/ a tapes/.
 function isSafeFileName(name) {
   return /^[A-Za-z0-9_.\-]+$/.test(name) && !name.startsWith('.');
 }
 
-async function fetchBinary(name) {
-  const file = /\.[A-Za-z0-9]+$/.test(name) ? name : `${name}.bin`;
-  const url = `bins/${file}`;
+async function fetchMedia(dir, ext, name) {
+  const file = /\.[A-Za-z0-9]+$/.test(name) ? name : `${name}.${ext}`;
+  const url = `${dir}/${file}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Nelze načíst ${url} (${r.status})`);
   return { file, data: new Uint8Array(await r.arrayBuffer()) };
@@ -886,19 +1006,27 @@ function waitForFrames(count) {
 async function startFromUrlParams() {
   const romName = getUrlParam('ROM');
   const binName = getUrlParam('BIN');
-  if (!romName && !binName) return;
+  const tapName = getUrlParam('TAP');
+  if (!romName && !binName && !tapName) return;
 
-  if (!romName) {
+  if (!romName && binName) {
     alert('Parametr BIN vyžaduje i parametr ROM.');
     return;
   }
   try {
-    if (!isSafeFileName(romName)) throw new Error(`Neplatný název ROM: ${romName}`);
+    if (romName && !isSafeFileName(romName)) throw new Error(`Neplatný název ROM: ${romName}`);
     if (binName && !isSafeFileName(binName)) throw new Error(`Neplatný název BIN: ${binName}`);
+    if (tapName && !isSafeFileName(tapName)) throw new Error(`Neplatný název TAP: ${tapName}`);
 
-    // BIN stáhnout předem, ať se chyba ukáže hned a ROM zbytečně nečeká.
-    const bin = binName ? await fetchBinary(binName) : null;
-    await startPreset(romName);
+    // Média stáhnout předem, ať se chyba ukáže hned a ROM zbytečně nečeká.
+    const bin = binName ? await fetchMedia('bins', 'bin', binName) : null;
+    const tap = tapName ? await fetchMedia('tapes', 'tap', tapName) : null;
+    if (romName) await startPreset(romName);
+    // Až po startu ROM: její reset by kazetu jen znovu přetočil.
+    if (tap) {
+      insertTape(tap.data, tap.file);
+      updateTapeSlot();
+    }
     if (bin) {
       setStatus(`Čekám na start ROM, pak zavedu ${bin.file}…`);
       await waitForFrames(BIN_AUTOLOAD_DELAY_FRAMES);

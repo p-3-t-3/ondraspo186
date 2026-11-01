@@ -105,6 +105,7 @@ let running     = false;
 let paused      = false;
 let frameHandle = null;
 let totalFrames = 0;
+let masterTstates = 0;       // společná časová osa emulovaného hardwaru
 
 // ----------------------------------------------------------------------------
 //  ROM loader
@@ -227,7 +228,8 @@ const memBus = {
     // MP0=1: paměťově mapované vstupy v 0xE000–0xFFFF
     if (ioEnabled && addr >= 0xE000) {
       dbgIoReads++;
-      return io[addr & 0xFF];
+      // bit 7 = vstup z magnetofonu
+      return (io[addr & 0xFF] & 0x7F) | (tapeIn << 7);
     }
     // MP1=0: ROM překrývá RAM v 0x0000–0x3FFF
     if (!mp1Enabled && addr < 0x4000) return readRom(addr);
@@ -253,6 +255,7 @@ const memBus = {
       const newStb = (val >> 3) & 1;                 // bit 3 = /STB pro Melodik
       port0A = val;
       updateLeds();
+      setTapeMotor(val & 0x10);                      // bit 4 = relé magnetofonu
       updateInternalSound((val >> 5) & 0x07);        // M3:M1 = tón 0–7
       // Sestupná hrana STB (1→0): zapsat port09 do SN76489
       // Protokol: OUT(0xFE,0x1F) → OUT(0xFD,byte) → OUT(0xFE,0x17)
@@ -300,6 +303,8 @@ function wrapIORead(port) {
 //    Worklet přehraje sample po samplu — každá změna tónu je časově přesná.
 //
 //  Audio buffer format: Uint8Array, jeden byte na vzorek
+//    bit  5:   úroveň přehrávané pásky
+//    bit  4:   páska hraje (příposlech vstupu magnetofonu)
 //    bity 3-1: tón 0-7 (ONDRA_FREQS)
 //    bit  0:   kazetový výstup (0/1)
 //
@@ -317,6 +322,7 @@ let _audioFrameBuf = null;
 let _audioFramePos = 0;
 let _audioTone     = 0;
 let _audioCas      = 0;
+let _audioTape     = 0;    // bity 5-4 audio bufferu
 
 // AudioWorklet kód — generuje průběh sample po samplu
 const WORKLET_CODE = `
@@ -326,6 +332,7 @@ class OndraSound extends AudioWorkletProcessor {
     this._tone    = 0;
     this._phase   = 0;
     this._casLvl  = 0;
+    this._tape    = 0;
     // Fronta snímků: emulátor je posílá z setInterval, který kolísá proti
     // hodinám zvukové karty. Rezerva dvou snímků výkyvy vyrovná; při
     // přeplnění se zahodí nejstarší, aby nerostlo zpoždění.
@@ -368,9 +375,12 @@ class OndraSound extends AudioWorkletProcessor {
         const packed = this._buf[this._bufPos++];
         this._tone   = (packed >> 1) & 0x07;
         this._casLvl =  packed       & 0x01;
+        this._tape   = (packed >> 4) & 0x03;
       }
       // Generovat vzorek: kazetový beeper + tónový oscilátor (čtvercový průběh)
       let s = this._casLvl ? 0.2 : -0.2;
+      // Příposlech pásky
+      if (this._tape & 0x01) s += this._tape & 0x02 ? 0.15 : -0.15;
       if (this._tone > 0) {
         this._phase = (this._phase + freqs[this._tone] / sampleRate) % 1;
         s += this._phase < 0.5 ? 0.2 : -0.2;
@@ -452,7 +462,7 @@ function _fillAudioFrame(toTstate, totalTstates) {
     Math.floor(toTstate / totalTstates * _audioFrameBuf.length),
     _audioFrameBuf.length
   );
-  const packed = ((_audioTone & 0x07) << 1) | (_audioCas & 0x01);
+  const packed = _audioTape | ((_audioTone & 0x07) << 1) | (_audioCas & 0x01);
   while (_audioFramePos < targetPos) _audioFrameBuf[_audioFramePos++] = packed;
 }
 
@@ -485,6 +495,13 @@ function queueSoundEvent(type, value) {
   // Kazetový beeper: zaznamenat hranu do audio bufferu
   _fillAudioFrame(frameTstates, cyclesPerFrame());
   _audioCas = value;
+}
+
+function queueTapeMonitor(active, level) {
+  const value = active ? 0x10 | (level ? 0x20 : 0) : 0;
+  if (value === _audioTape) return;
+  _fillAudioFrame(frameTstates, cyclesPerFrame());
+  _audioTape = value;
 }
 
 // ----------------------------------------------------------------------------
@@ -575,6 +592,8 @@ function emulatorFrame() {
       const c = cpu.run_instruction();
       cycles += c;
       frameTstates += c;
+      masterTstates += c;
+      advanceTape(c);
     }
   };
 
@@ -589,6 +608,8 @@ function emulatorFrame() {
   // obrazu. Příděl CPU proto určujeme až podle stavu na začátku obrazové DMA.
   const target = cyclesPerFrame();
   runCpuUntil(target);
+  // Během obrazové DMA CPU stojí, ale páska se točí dál.
+  if (cycles < FRAME_TSTATES) advanceTape(FRAME_TSTATES - cycles);
 
   _flushAudioFrame(target);
   totalFrames++;
@@ -758,9 +779,12 @@ function _resetState() {
   if (melodikBusyTimer) { clearTimeout(melodikBusyTimer); melodikBusyTimer = null; }
   videoEnabled = false; mp1Enabled = false; ioEnabled = false;
   selected8253 = 0; nRozliseni = 0;
+  masterTstates = 0;
   soundTone = 0; cassetteOut = 0;
-  _audioTone = 0; _audioCas = 0; _audioFramePos = 0;
+  _audioTone = 0; _audioCas = 0; _audioTape = 0; _audioFramePos = 0;
   frameTstates = 0; dbgIoReads = 0; totalFrames = 0;
+  tapeMotor = false;
+  rewindTape();            // vložená kazeta zůstává, reset ji přetočí na začátek
   resetKeyboardInputs();
   rebuildDispAdr(0);
 }
@@ -873,30 +897,57 @@ function updateDebug() {
 }
 
 // ----------------------------------------------------------------------------
-//  Snapshoty (.osn)
+//  Snapshoty ESNAP 1.0
 //
-//  28B pevná hlavička:
-//    0..7   "ONDRASNP"
-//    8..9   verze formátu (LE)
-//    12..15 délka JSON hlavičky
-//    16..19 délka RAM
-//    20..23 délka ROM
-//    24..27 CRC32 celého payloadu (JSON + RAM + ROM)
+//  Obecný kontejner je v ESnap.js. Tato část definuje pouze přenositelné
+//  binární schéma komponent Ondry. Žádná data hostitele (DOM, AudioContext,
+//  GPIO, fyzické klávesy) se neukládají.
 // ----------------------------------------------------------------------------
 
-const SNAP_MAGIC = 'ONDRASNP';
-const SNAP_VERSION = 1;
-const SNAP_FIXED_HEADER = 28;
+const ESNAP_MACHINE_ID = 'ondra-spo186';
+const ESNAP_SCHEMA = 1;
+const ESNAP_REQUIRED = ESnap.ChunkFlags.REQUIRED;
+const ESNAP_MEDIA = ESnap.ChunkFlags.MEDIA;
+const ESNAP_CPU_ARCH = 'Z80 ';
+const ESNAP_CPU_STATE_VERSION = 1;
 
-function crc32(bytes) {
-  let crc = 0xFFFFFFFF;
-  for (let i = 0; i < bytes.length; i++) {
-    crc ^= bytes[i];
-    for (let bit = 0; bit < 8; bit++) {
-      crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
-    }
-  }
-  return (crc ^ 0xFFFFFFFF) >>> 0;
+function encodeSystemIdentity(machineId, variant) {
+  const id = new TextEncoder().encode(machineId);
+  const model = new TextEncoder().encode(variant);
+  if (!id.length || id.length > 255 || model.length > 255) throw new Error('Identifikace stroje je příliš dlouhá.');
+  const bytes = new Uint8Array(4 + id.length + model.length);
+  const view = new DataView(bytes.buffer);
+  view.setUint16(0, id.length, true);
+  view.setUint16(2, model.length, true);
+  bytes.set(id, 4);
+  bytes.set(model, 4 + id.length);
+  return bytes;
+}
+
+function decodeSystemIdentity(bytes) {
+  if (bytes.length < 4) throw new Error('Blok SYS má neplatnou délku.');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const idLength = view.getUint16(0, true);
+  const variantLength = view.getUint16(2, true);
+  if (!idLength || 4 + idLength + variantLength !== bytes.length) throw new Error('Blok SYS je poškozený.');
+  return {
+    machineId: new TextDecoder().decode(bytes.subarray(4, 4 + idLength)),
+    variant: new TextDecoder().decode(bytes.subarray(4 + idLength))
+  };
+}
+
+function flagsToByte(flags) {
+  return ((flags.S & 1) << 7) | ((flags.Z & 1) << 6) | ((flags.Y & 1) << 5) |
+         ((flags.H & 1) << 4) | ((flags.X & 1) << 3) | ((flags.P & 1) << 2) |
+         ((flags.N & 1) << 1) | (flags.C & 1);
+}
+
+function byteToFlags(value) {
+  return {
+    S: (value >> 7) & 1, Z: (value >> 6) & 1, Y: (value >> 5) & 1,
+    H: (value >> 4) & 1, X: (value >> 3) & 1, P: (value >> 2) & 1,
+    N: (value >> 1) & 1, C: value & 1
+  };
 }
 
 function validateCpuState(state) {
@@ -916,98 +967,236 @@ function validateCpuState(state) {
   }
   if (!integerIn(state.imode, 2) || !integerIn(state.iff1, 1) || !integerIn(state.iff2, 1) ||
       typeof state.halted !== 'boolean' || typeof state.do_delayed_di !== 'boolean' ||
-      typeof state.do_delayed_ei !== 'boolean' || !Number.isFinite(state.cycle_counter)) {
+      typeof state.do_delayed_ei !== 'boolean' || !Number.isInteger(state.cycle_counter) ||
+      state.cycle_counter < 0 || state.cycle_counter > 0xFFFFFFFF) {
     throw new Error('Snapshot obsahuje neplatný řídicí stav CPU.');
   }
 }
 
+function encodeCpuState(state) {
+  validateCpuState(state);
+  const bytes = new Uint8Array(40);
+  const view = new DataView(bytes.buffer);
+  for (let i = 0; i < 4; i++) bytes[i] = ESNAP_CPU_ARCH.charCodeAt(i);
+  view.setUint16(4, ESNAP_CPU_STATE_VERSION, true);
+  view.setUint16(6, 0, true); // CPU flags, zatím rezervováno
+  bytes.set([
+    state.a, flagsToByte(state.flags), state.b, state.c, state.d, state.e, state.h, state.l,
+    state.a_prime, flagsToByte(state.flags_prime), state.b_prime, state.c_prime,
+    state.d_prime, state.e_prime, state.h_prime, state.l_prime
+  ], 8);
+  view.setUint16(24, state.ix, true);
+  view.setUint16(26, state.iy, true);
+  view.setUint16(28, state.sp, true);
+  view.setUint16(30, state.pc, true);
+  bytes[32] = state.i;
+  bytes[33] = state.r;
+  bytes[34] = state.imode;
+  bytes[35] = (state.iff1 & 1) | ((state.iff2 & 1) << 1) |
+    (+state.halted << 2) | (+state.do_delayed_di << 3) | (+state.do_delayed_ei << 4);
+  view.setUint32(36, state.cycle_counter, true);
+  return bytes;
+}
+
+function decodeCpuState(bytes) {
+  if (bytes.length !== 40) throw new Error('Blok CPU má neplatnou délku.');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const architecture = String.fromCharCode(...bytes.subarray(0, 4));
+  const stateVersion = view.getUint16(4, true);
+  const cpuFlags = view.getUint16(6, true);
+  if (architecture !== ESNAP_CPU_ARCH) {
+    throw new Error(`Snapshot používá nepodporovaný procesor ${architecture.trim() || 'neznámý'}.`);
+  }
+  if (stateVersion !== ESNAP_CPU_STATE_VERSION || cpuFlags !== 0) {
+    throw new Error(`Nepodporované schéma stavu ${ESNAP_CPU_ARCH.trim()} verze ${stateVersion}.`);
+  }
+  const control = bytes[35];
+  const state = {
+    a: bytes[8], flags: byteToFlags(bytes[9]), b: bytes[10], c: bytes[11],
+    d: bytes[12], e: bytes[13], h: bytes[14], l: bytes[15],
+    a_prime: bytes[16], flags_prime: byteToFlags(bytes[17]),
+    b_prime: bytes[18], c_prime: bytes[19], d_prime: bytes[20], e_prime: bytes[21],
+    h_prime: bytes[22], l_prime: bytes[23],
+    ix: view.getUint16(24, true), iy: view.getUint16(26, true),
+    sp: view.getUint16(28, true), pc: view.getUint16(30, true),
+    i: bytes[32], r: bytes[33], imode: bytes[34],
+    iff1: control & 1, iff2: (control >> 1) & 1,
+    halted: !!(control & 0x04), do_delayed_di: !!(control & 0x08),
+    do_delayed_ei: !!(control & 0x10), cycle_counter: view.getUint32(36, true)
+  };
+  validateCpuState(state);
+  return state;
+}
+
+function encodeMachineState() {
+  return new Uint8Array([
+    port03 & 0xFF, port0A & 0xFF, port09 & 0xFF, melodikStb & 1,
+    nRozliseni & 0xFF, soundTone & 0x07, cassetteOut & 1, 0
+  ]);
+}
+
+function decodeMachineState(bytes) {
+  if (bytes.length !== 8) throw new Error('Blok MACH má neplatnou délku.');
+  return {
+    port03: bytes[0], port0A: bytes[1], port09: bytes[2], melodikStb: bytes[3] & 1,
+    nRozliseni: bytes[4], soundTone: bytes[5] & 0x07, cassetteOut: bytes[6] & 1
+  };
+}
+
+function encodeTimeState() {
+  if (!Number.isSafeInteger(masterTstates) || masterTstates < 0 ||
+      !Number.isSafeInteger(totalFrames) || totalFrames < 0) {
+    throw new Error('Časová osa emulátoru je mimo rozsah ESNAP.');
+  }
+  const bytes = new Uint8Array(16);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(0, BigInt(masterTstates), true);
+  view.setBigUint64(8, BigInt(totalFrames), true);
+  return bytes;
+}
+
+function decodeTimeState(bytes) {
+  if (bytes.length !== 16) throw new Error('Blok TIME má neplatnou délku.');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ticks = view.getBigUint64(0, true);
+  const frames = view.getBigUint64(8, true);
+  if (ticks > BigInt(Number.MAX_SAFE_INTEGER) || frames > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error('Časová osa ESNAP je příliš dlouhá pro tuto implementaci.');
+  }
+  return { masterTstates: Number(ticks), totalFrames: Number(frames) };
+}
+
+const PHASE_SCALE = 0x100000000;
+function phaseToU32(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error('Neplatná fáze SN76489.');
+  const normalized = ((value % 1) + 1) % 1;
+  return Math.floor(normalized * PHASE_SCALE) >>> 0;
+}
+
+function encodePsgState(state) {
+  if (!state || !Array.isArray(state.registers) || state.registers.length !== 8 ||
+      !Array.isArray(state.tonePhases) || state.tonePhases.length !== 3 ||
+      !state.registers.every(Number.isFinite) || !state.tonePhases.every(Number.isFinite) ||
+      !Number.isFinite(state.noisePhase) || !Number.isInteger(state.noiseShiftRegister)) {
+    throw new Error('SN76489 neposkytl úplný stav pro ESNAP.');
+  }
+  const bytes = new Uint8Array(48);
+  const view = new DataView(bytes.buffer);
+  state.registers.forEach((value, i) => view.setUint16(i * 2, value & 0x03FF, true));
+  bytes[16] = state.latchedRegister & 0x07;
+  state.tonePhases.forEach((value, i) => view.setUint32(20 + i * 4, phaseToU32(value), true));
+  view.setUint32(32, phaseToU32(state.noisePhase), true);
+  view.setUint32(36, state.noiseShiftRegister >>> 0, true);
+  view.setUint32(40, Number.isInteger(state.writeCount) ? state.writeCount >>> 0 : 0, true);
+  view.setUint16(44, state.lastWrite === null ? 0xFFFF : (state.lastWrite & 0xFF), true);
+  return bytes;
+}
+
+function decodePsgState(bytes) {
+  if (bytes.length !== 48) throw new Error('Blok PSG má neplatnou délku.');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const registers = Array.from({ length: 8 }, (_, i) => view.getUint16(i * 2, true));
+  const lastWrite = view.getUint16(44, true);
+  return {
+    registers,
+    latchedRegister: bytes[16] & 0x07,
+    tonePhases: Array.from({ length: 3 }, (_, i) => view.getUint32(20 + i * 4, true) / PHASE_SCALE),
+    noisePhase: view.getUint32(32, true) / PHASE_SCALE,
+    noiseShiftRegister: view.getUint32(36, true),
+    writeCount: view.getUint32(40, true),
+    lastWrite: lastWrite === 0xFFFF ? null : (lastWrite & 0xFF)
+  };
+}
+
+function requireOndraChunk(snapshot, type, length = null, encoding = ESnap.Encoding.RAW) {
+  const chunk = ESnap.findChunk(snapshot, type);
+  if (chunk.schema !== ESNAP_SCHEMA) throw new Error(`Nepodporované schéma bloku ${type}: ${chunk.schema}.`);
+  if (chunk.encoding !== encoding) throw new Error(`Blok ${type} má nepodporované kódování.`);
+  if (length !== null && chunk.data.length !== length) throw new Error(`Blok ${type} má neplatnou délku.`);
+  return chunk;
+}
+
 function createSnapshotBuffer() {
   if (!cpu) throw new Error('Emulátor ještě není spuštěný.');
-  const header = {
-    machine: 'Ondra SPO 186',
+  if (!window.ESnap) throw new Error('Kontejner ESNAP není dostupný.');
+
+  const meta = {
+    format: 'ESNAP',
+    machineId: ESNAP_MACHINE_ID,
+    machineName: 'Ondra SPO 186',
+    variant: 'default',
     createdAt: new Date().toISOString(),
-    cpu: cpu.getState(),
-    machineState: {
-      port03, port0A, port09, melodikStb, nRozliseni,
-      soundTone, cassetteOut, totalFrames
-    },
-    execution: { paused },
-    psg: psg ? psg.getState() : null
+    emulator: { id: 'ondra-web', snapshotSchema: ESNAP_SCHEMA }
   };
 
-  const json = new TextEncoder().encode(JSON.stringify(header));
-  const ramBytes = new Uint8Array(mem);
-  const romBytes = new Uint8Array(rom);
-  const payload = new Uint8Array(json.length + ramBytes.length + romBytes.length);
-  payload.set(json, 0);
-  payload.set(ramBytes, json.length);
-  payload.set(romBytes, json.length + ramBytes.length);
-
-  const result = new Uint8Array(SNAP_FIXED_HEADER + payload.length);
-  result.set(new TextEncoder().encode(SNAP_MAGIC), 0);
-  const view = new DataView(result.buffer);
-  view.setUint16(8, SNAP_VERSION, true);
-  view.setUint32(12, json.length, true);
-  view.setUint32(16, ramBytes.length, true);
-  view.setUint32(20, romBytes.length, true);
-  view.setUint32(24, crc32(payload), true);
-  result.set(payload, SNAP_FIXED_HEADER);
-  return result.buffer;
+  const chunks = [
+    ESnap.rawChunk('SYS ', encodeSystemIdentity(ESNAP_MACHINE_ID, 'default'), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED }),
+    ESnap.jsonChunk('META', meta, { schema: ESNAP_SCHEMA }),
+    ESnap.rawChunk('TIME', encodeTimeState(), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED }),
+    ESnap.rawChunk('CPU ', encodeCpuState(cpu.getState()), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED }),
+    ESnap.rawChunk('MACH', encodeMachineState(), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED }),
+    ESnap.rawChunk('RAM ', new Uint8Array(mem), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED }),
+    ESnap.rawChunk('ROM ', new Uint8Array(rom), { schema: ESNAP_SCHEMA, flags: ESNAP_REQUIRED | ESNAP_MEDIA })
+  ];
+  if (psg) chunks.push(ESnap.rawChunk('PSG ', encodePsgState(psg.getState()), { schema: ESNAP_SCHEMA }));
+  chunks.push(ESnap.rawChunk('EXEC', new Uint8Array([+paused]), { schema: ESNAP_SCHEMA }));
+  return ESnap.encode(chunks);
 }
 
 function parseSnapshotBuffer(buffer) {
-  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < SNAP_FIXED_HEADER) {
-    throw new Error('Soubor je příliš krátký.');
-  }
-  const bytes = new Uint8Array(buffer);
-  const magic = new TextDecoder().decode(bytes.slice(0, 8));
-  if (magic !== SNAP_MAGIC) throw new Error('Soubor není snapshot webulátoru Ondry.');
+  if (!window.ESnap) throw new Error('Kontejner ESNAP není dostupný.');
+  const snapshot = ESnap.decode(buffer);
+  const supportedKeys = new Set(['SYS /0', 'META/0', 'TIME/0', 'CPU /0', 'MACH/0', 'RAM /0', 'ROM /0', 'PSG /0', 'EXEC/0']);
+  const unknownRequired = snapshot.chunks.find(chunk =>
+    !supportedKeys.has(`${chunk.type}/${chunk.instance}`) && (chunk.flags & ESnap.ChunkFlags.REQUIRED));
+  if (unknownRequired) throw new Error(`Snapshot vyžaduje neznámý blok ${unknownRequired.type}.`);
 
-  const view = new DataView(buffer);
-  const version = view.getUint16(8, true);
-  if (version !== SNAP_VERSION) throw new Error(`Nepodporovaná verze snapshotu ${version}.`);
-  const jsonLength = view.getUint32(12, true);
-  const ramLength = view.getUint32(16, true);
-  const romLength = view.getUint32(20, true);
-  const expectedCrc = view.getUint32(24, true);
-  const expectedLength = SNAP_FIXED_HEADER + jsonLength + ramLength + romLength;
-  if (ramLength !== MEM_SIZE || romLength !== 0x4000 || expectedLength !== bytes.length) {
-    throw new Error('Snapshot má neplatnou velikost paměti nebo je neúplný.');
+  const system = decodeSystemIdentity(requireOndraChunk(snapshot, 'SYS ').data);
+  if (system.machineId !== ESNAP_MACHINE_ID) {
+    throw new Error(`Snapshot není určen pro Ondru SPO 186 (${system.machineId || 'neznámý stroj'}).`);
+  }
+  const metaChunk = ESnap.findChunk(snapshot, 'META', 0, false);
+  let meta = { format: 'ESNAP', machineId: system.machineId, variant: system.variant };
+  if (metaChunk) {
+    if (metaChunk.schema !== ESNAP_SCHEMA || metaChunk.encoding !== ESnap.Encoding.JSON) {
+      throw new Error('Blok META má nepodporované schéma nebo kódování.');
+    }
+    meta = ESnap.parseJsonChunk(metaChunk);
+    if (!meta || meta.format !== 'ESNAP' || meta.machineId !== system.machineId || meta.variant !== system.variant) {
+      throw new Error('Blok META neodpovídá identifikaci stroje v bloku SYS.');
+    }
   }
 
-  const payload = bytes.slice(SNAP_FIXED_HEADER);
-  if (crc32(payload) !== expectedCrc) throw new Error('Kontrolní součet snapshotu nesouhlasí.');
-  let header;
-  try {
-    header = JSON.parse(new TextDecoder().decode(payload.slice(0, jsonLength)));
-  } catch(e) {
-    throw new Error('Metadata snapshotu jsou poškozená.');
+  const ram = requireOndraChunk(snapshot, 'RAM ', MEM_SIZE).data;
+  const romData = requireOndraChunk(snapshot, 'ROM ', 0x4000).data;
+  const psgChunk = ESnap.findChunk(snapshot, 'PSG ', 0, false);
+  if (psgChunk && (psgChunk.schema !== ESNAP_SCHEMA || psgChunk.encoding !== ESnap.Encoding.RAW)) {
+    throw new Error('Blok PSG má nepodporované schéma nebo kódování.');
   }
-  if (header.machine !== 'Ondra SPO 186' || !header.machineState || !header.execution) {
-    throw new Error('Snapshot neobsahuje platný stav Ondry.');
+  const execChunk = ESnap.findChunk(snapshot, 'EXEC', 0, false);
+  if (execChunk && (execChunk.schema !== ESNAP_SCHEMA || execChunk.encoding !== ESnap.Encoding.RAW || execChunk.data.length !== 1)) {
+    throw new Error('Blok EXEC má neplatný formát.');
   }
-  validateCpuState(header.cpu);
 
-  const machineFields = ['port03','port0A','port09','melodikStb','nRozliseni','soundTone','cassetteOut'];
-  if (!machineFields.every(name => Number.isInteger(header.machineState[name]))) {
-    throw new Error('Snapshot obsahuje neplatný stav periferií.');
-  }
-  const ramOffset = jsonLength;
-  const romOffset = ramOffset + ramLength;
   return {
-    header,
-    ram: payload.slice(ramOffset, romOffset),
-    rom: payload.slice(romOffset, romOffset + romLength)
+    meta,
+    cpu: decodeCpuState(requireOndraChunk(snapshot, 'CPU ', 40).data),
+    machine: decodeMachineState(requireOndraChunk(snapshot, 'MACH', 8).data),
+    time: decodeTimeState(requireOndraChunk(snapshot, 'TIME', 16).data),
+    ram,
+    rom: romData,
+    psg: psgChunk ? decodePsgState(psgChunk.data) : null,
+    paused: execChunk ? !!execChunk.data[0] : false
   };
 }
 
 function restoreSnapshotBuffer(buffer) {
   const snapshot = parseSnapshotBuffer(buffer);
   let restoredPsg = null;
-  if (snapshot.header.psg) {
+  if (snapshot.psg) {
     if (!window.SN76489) throw new Error('Emulace SN76489 není dostupná.');
     restoredPsg = new SN76489();
-    restoredPsg.setState(snapshot.header.psg);
+    restoredPsg.setState(snapshot.psg);
   }
 
   // Snapshot je samostatný: musí jít načíst i před prvním spuštěním ROM.
@@ -1032,12 +1221,12 @@ function restoreSnapshotBuffer(buffer) {
   rom = new Uint8Array(snapshot.rom);
   romSize = rom.length;
   try {
-    cpu.setState(snapshot.header.cpu);
+    cpu.setState(snapshot.cpu);
   } catch(e) {
     throw new Error('Nepodařilo se obnovit stav CPU: ' + e.message);
   }
 
-  const state = snapshot.header.machineState;
+  const state = snapshot.machine;
   port03 = state.port03 & 0xFF;
   port0A = state.port0A & 0xFF;
   port09 = state.port09 & 0xFF;
@@ -1053,7 +1242,11 @@ function restoreSnapshotBuffer(buffer) {
   _audioCas = cassetteOut;
   _audioFramePos = 0;
   frameTstates = 0;
-  totalFrames = Number.isInteger(state.totalFrames) ? state.totalFrames : 0;
+  // ESNAP schéma 1 neobsahuje pozici pásky, proto se přehrávání zastaví.
+  tapeMotor = !!(port0A & 0x10);
+  stopTape();
+  masterTstates = snapshot.time.masterTstates;
+  totalFrames = snapshot.time.totalFrames;
   if (melodikBusyTimer) { clearTimeout(melodikBusyTimer); melodikBusyTimer = null; }
   psg = restoredPsg;
   io.fill(0xFF); // fyzicky stisknuté klávesy se do snapshotu nepřenášejí
@@ -1061,7 +1254,7 @@ function restoreSnapshotBuffer(buffer) {
   updateLeds();
   renderFrame();
   updateDebug();
-  paused = !!snapshot.header.execution.paused;
+  paused = snapshot.paused;
   setStatus(paused ? '📂 Snapshot obnoven — pozastaveno' : '📂 Snapshot obnoven');
 }
 
@@ -1069,10 +1262,10 @@ function saveSnapshot() {
   try {
     const data = createSnapshotBuffer();
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    const url = URL.createObjectURL(new Blob([data], { type: 'application/octet-stream' }));
+    const url = URL.createObjectURL(new Blob([data], { type: 'application/x-emulator-snapshot' }));
     const link = document.createElement('a');
     link.href = url;
-    link.download = `ondra-${stamp}.osn`;
+    link.download = `ondra-${stamp}.esnap`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     setStatus('💾 Snapshot uložen');
@@ -1123,14 +1316,166 @@ function setStatus(msg) {
 }
 
 // ----------------------------------------------------------------------------
-//  Tape loader — Phase 2
+//  Kazeta TAP — přehrávání do vstupu magnetofonu
+//
+//  Stejný signál jako picoM8 (tape_files.cpp). TAP je sekvence bloků:
+//    hlavička 25 B ('H', jméno…, [16]='D', [21..22]=délka LE, [24]=součet 1..23)
+//    'D' + data (délka B) + součet dat; mezi částmi smí být CR/LF
+//  Na pásku jde každý blok jako:
+//    pauza 800 bitů 0 → pilot 1600 bitů 1 → 0x7F → hlavička → 0 → pauza
+//    → pilot → 0x7F → 'D' + data + součet → 0 → pauza
+//  Bajt má 9 bitů: invertovaný bit 0 a pak bity 0–7 od nejnižšího. Pauza za
+//  hlavičkou i daty zarovnává proud na celé bajty (8–16 nulových bitů).
+//  Každý bit tvoří dvě půlvlny po 407 T: úroveň bitu, pak opačná.
+//
+//  Vstup: bit 7 při čtení 0xE000–0xFFFF (MP0=1), klid = 1.
+//  Motor: relé, bit 4 portu 0Ah. Páska běží jen se zapnutým motorem.
 // ----------------------------------------------------------------------------
 
-function loadTape(input) {
-  const file = input.files[0];
-  if (!file) return;
-  setStatus(`📼 ${file.name} — načítání pásky zatím není implementováno`);
-  input.value = '';
+const TAP_HALF_WAVE_TSTATES = 407;
+const TAP_INIT_PAUSE_BITS   = 100 * 8;
+const TAP_PILOT_BITS        = 200 * 8;
+const FRAME_TSTATES         = 312 * 128;  // páska běží i během obrazové DMA
+
+const tape = {
+  name: '', bits: null, blocks: 0, dataBytes: 0,
+  state: 'empty',          // empty | stopped | armed | playing | done
+  halfWave: 0, remaining: 0
+};
+let tapeMotor = false;
+let tapeIn    = 1;
+
+function skipLfCr(bytes, pos) {
+  while (pos < bytes.length && (bytes[pos] === 0x0A || bytes[pos] === 0x0D)) pos++;
+  return pos;
+}
+
+function parseTap(bytes) {
+  const blocks = [];
+  let dataBytes = 0;
+  let pos = 0;
+  while (pos < bytes.length) {
+    if (bytes.length - pos < 25) throw new Error('Neočekávaný konec hlavičky TAP.');
+    const header = bytes.subarray(pos, pos + 25);
+    pos += 25;
+    if (header[0] !== 0x48) throw new Error('Špatný příznak hlavičky TAP.');
+    if (header[16] !== 0x44) throw new Error('Špatný typ hlavičky TAP.');
+    let sum = 0;
+    for (let i = 1; i < 24; i++) sum = (sum + header[i]) & 0xFF;
+    if (header[24] !== sum) throw new Error('Špatný kontrolní součet hlavičky TAP.');
+
+    const length = header[21] | (header[22] << 8);
+    pos = skipLfCr(bytes, pos);
+    if (pos >= bytes.length) throw new Error('Chybí datový blok TAP.');
+    if (bytes[pos] !== 0x44) throw new Error('Špatný datový příznak TAP.');
+    if (bytes.length - pos < length + 2) throw new Error('Zkrácený datový blok TAP.');
+    const payload = bytes.subarray(pos, pos + length + 2);   // 'D' + data + součet
+    sum = 0;
+    for (let i = 1; i <= length; i++) sum = (sum + payload[i]) & 0xFF;
+    if (payload[length + 1] !== sum) throw new Error('Špatný kontrolní součet dat TAP.');
+    pos = skipLfCr(bytes, pos + length + 2);
+
+    blocks.push({ header, payload });
+    dataBytes += length;
+  }
+  if (!blocks.length) throw new Error('Prázdný TAP.');
+  return { blocks, dataBytes };
+}
+
+function buildTapBits(blocks) {
+  const bits = [];
+  const emit = (bit, count = 1) => { for (let i = 0; i < count; i++) bits.push(bit); };
+  const rawByte = value => { for (let i = 0; i < 8; i++) emit((value >> i) & 1); };
+  const tapByte = value => { emit((value & 1) ^ 1); rawByte(value); };
+  const alignedPause = () => emit(0, (bits.length & 7) ? 16 - (bits.length & 7) : 16);
+  for (const { header, payload } of blocks) {
+    emit(0, TAP_INIT_PAUSE_BITS);
+    emit(1, TAP_PILOT_BITS);
+    rawByte(0x7F);
+    header.forEach(tapByte);
+    tapByte(0);
+    alignedPause();
+    emit(1, TAP_PILOT_BITS);
+    rawByte(0x7F);
+    payload.forEach(tapByte);
+    tapByte(0);
+    alignedPause();
+  }
+  return Uint8Array.from(bits);
+}
+
+function setTapeLevel(level, monitor) {
+  tapeIn = level;
+  queueTapeMonitor(monitor, level);
+}
+
+function updateTapeTransport() {
+  if (tape.state !== 'armed' && tape.state !== 'playing') return;
+  tape.state = tapeMotor ? 'playing' : 'armed';
+  if (!tapeMotor) setTapeLevel(1, false);
+}
+
+function setTapeMotor(on) {
+  tapeMotor = !!on;
+  updateTapeTransport();
+}
+
+// Přetočí vloženou kazetu na začátek a čeká na motor.
+function rewindTape() {
+  if (!tape.bits) return false;
+  tape.halfWave = 0;
+  tape.remaining = 0;
+  tape.state = 'armed';
+  setTapeLevel(1, false);
+  updateTapeTransport();
+  return true;
+}
+
+function stopTape() {
+  if (tape.bits) tape.state = 'stopped';
+  tape.remaining = 0;
+  setTapeLevel(1, false);
+}
+
+function insertTape(bytes, name) {
+  const { blocks, dataBytes } = parseTap(bytes);
+  tape.name = name;
+  tape.bits = buildTapBits(blocks);
+  tape.blocks = blocks.length;
+  tape.dataBytes = dataBytes;
+  rewindTape();
+}
+
+function ejectTape() {
+  stopTape();
+  Object.assign(tape, { name: '', bits: null, blocks: 0, dataBytes: 0, state: 'empty' });
+}
+
+function advanceTape(tstates) {
+  if (tape.state !== 'playing') return;
+  while (tstates > 0) {
+    if (!tape.remaining) {
+      if (tape.halfWave >= tape.bits.length * 2) {
+        tape.state = 'done';
+        setTapeLevel(1, false);
+        return;
+      }
+      setTapeLevel(tape.bits[tape.halfWave >> 1] ^ (tape.halfWave & 1), true);
+      tape.halfWave++;
+      tape.remaining = TAP_HALF_WAVE_TSTATES;
+    }
+    if (tstates < tape.remaining) { tape.remaining -= tstates; return; }
+    tstates -= tape.remaining;
+    tape.remaining = 0;
+  }
+}
+
+function tapeStatus() {
+  const total = tape.bits ? tape.bits.length * 2 : 0;
+  return {
+    name: tape.name, state: tape.state, blocks: tape.blocks, dataBytes: tape.dataBytes,
+    progress: tape.state === 'done' ? 100 : total ? Math.floor(tape.halfWave * 100 / total) : 0
+  };
 }
 
 // ----------------------------------------------------------------------------
